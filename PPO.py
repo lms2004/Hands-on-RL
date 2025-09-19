@@ -29,7 +29,7 @@ class ValueNet(torch.nn.Module):
 
 
 class PPO:
-    ''' PPO算法,采用截断方式 '''
+    ''' PPO算法,采用截断方式 (Clipped PPO) '''
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                  lmbda, epochs, eps, gamma, device):
         self.actor = PolicyNet(state_dim, hidden_dim, action_dim).to(device)
@@ -38,54 +38,63 @@ class PPO:
                                                 lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
                                                  lr=critic_lr)
-        self.gamma = gamma
-        self.lmbda = lmbda
-        self.epochs = epochs  # 一条序列的数据用来训练轮数
-        self.eps = eps  # PPO中截断范围的参数
+        self.gamma = gamma         # 折扣因子 γ
+        self.lmbda = lmbda         # GAE λ
+        self.epochs = epochs       # 每条轨迹训练轮数
+        self.eps = eps             # PPO clip 参数
         self.device = device
 
     def take_action(self, state):
+        # 将状态转为 tensor 并加 batch 维度 [1, state_dim]
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        probs = self.actor(state)
+        probs = self.actor(state)  # π(a|s)
         action_dist = torch.distributions.Categorical(probs)
-        action = action_dist.sample()
+        action = action_dist.sample()  # 从策略分布采样动作
         return action.item()
 
-
     def update(self, transition_dict):
-        states = torch.tensor(transition_dict['states'],
-                              dtype=torch.float).to(self.device)
-        actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(
-            self.device)
-        rewards = torch.tensor(transition_dict['rewards'],
-                               dtype=torch.float).view(-1, 1).to(self.device)
-        next_states = torch.tensor(transition_dict['next_states'],
-                                   dtype=torch.float).to(self.device)
-        dones = torch.tensor(transition_dict['dones'],
-                             dtype=torch.float).view(-1, 1).to(self.device)
-        td_target = rewards + self.gamma * self.critic(next_states) * (1 -
-                                                                       dones)
+        # 转换成 tensor
+        states = torch.tensor(transition_dict['states'], dtype=torch.float).to(self.device)
+        actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(self.device)
+        rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float).view(-1, 1).to(self.device)
+        next_states = torch.tensor(transition_dict['next_states'], dtype=torch.float).to(self.device)
+        dones = torch.tensor(transition_dict['dones'], dtype=torch.float).view(-1, 1).to(self.device)
+
+        # TD Target: r + γ * V(s')
+        # 对应公式：δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
         td_delta = td_target - self.critic(states)
-        advantage = rl_utils.compute_advantage(self.gamma, self.lmbda,
-                                               td_delta.cpu()).to(self.device)
-        old_log_probs = torch.log(self.actor(states).gather(1,
-                                                            actions)).detach()
+
+        # Advantage 估计 (GAE)
+        # A_t = δ_t + (γ * λ) * δ_{t+1} + (γ * λ)^2 * δ_{t+2} + ...
+        advantage = rl_utils.compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+
+        # 旧策略下 log π(a|s)
+        old_log_probs = torch.log(self.actor(states).gather(1, actions)).detach()
 
         for _ in range(self.epochs):
+            # 新策略下 log π(a|s)
             log_probs = torch.log(self.actor(states).gather(1, actions))
+            # 比率 r(θ) = π_θ(a|s) / π_{θ_old}(a|s)
             ratio = torch.exp(log_probs - old_log_probs)
+
+            # PPO Clipped Objective
+            # L^CLIP(θ) = E[min(r(θ) * A, clip(r(θ), 1-ε, 1+ε) * A)]
             surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps,
-                                1 + self.eps) * advantage  # 截断
-            actor_loss = torch.mean(-torch.min(surr1, surr2))  # PPO损失函数
-            critic_loss = torch.mean(
-                F.mse_loss(self.critic(states), td_target.detach()))
+            surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
+            actor_loss = torch.mean(-torch.min(surr1, surr2))  # 最大化 L^CLIP => 最小化 -L^CLIP
+
+            # Critic loss: MSE between V(s) and TD target
+            critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
+
+            # 梯度更新
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
             actor_loss.backward()
             critic_loss.backward()
             self.actor_optimizer.step()
             self.critic_optimizer.step()
+
 
 
 actor_lr = 1e-3
@@ -138,3 +147,17 @@ return_list = rl_utils.train_on_policy_agent(env, agent, num_episodes)
 # return=200.000]
 # Iteration 9: 100%|██████████| 50/50 [00:22<00:00,  2.25it/s, episode=500,
 # return=200.000]
+
+episodes_list = list(range(len(return_list)))
+plt.plot(episodes_list, return_list)
+plt.xlabel('Episodes')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
+plt.show()
+
+mv_return = rl_utils.moving_average(return_list, 9)
+plt.plot(episodes_list, mv_return)
+plt.xlabel('Episodes')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
+plt.show()
